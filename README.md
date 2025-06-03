@@ -6,7 +6,8 @@ Uses xdotool to send the text generated as keystrokes into the active applicatio
 Only tested on Arch Linux. Set up a keybind (e.g. `super+alt+v`) that runs:
 
 ```
-echo "toggle" | nc -U /tmp/sttdict.sock
+SOCK=$(python -c "import tempfile, os; print(os.path.join(tempfile.gettempdir(), 'sttdict.sock'))")
+echo "toggle" | nc -U "$SOCK"
 ```
 
 Pressing it again stops dictation. If you set `STT_SOCK_PATH`, update the socket path accordingly.

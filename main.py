@@ -12,6 +12,8 @@ import atexit
 import shutil
 import uuid
 import signal
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
@@ -22,7 +24,9 @@ import webrtcvad
 import nemo.collections.asr as nemo_asr
 
 # ========== CONSTANTS ==========
-SOCK_PATH = os.environ.get("STT_SOCK_PATH", "/tmp/sttdict.sock")
+TEMP_DIR = tempfile.gettempdir()
+SOCK_PATH = os.environ.get("STT_SOCK_PATH", os.path.join(TEMP_DIR, "sttdict.sock"))
+STATE_PATH = Path(TEMP_DIR) / "sttdict.state"
 VOLUME_THRESHOLD = 0.01  # Adjust to filter silence
 VAD_SENSITIVITY = 2  # 0=least, 3=most sensitive
 SAMPLE_RATE = 16000  # Parakeet expects 16kHz mono audio
@@ -85,7 +89,7 @@ class DictationControl:
 
     def _write_state(self):
         try:
-            with open("/tmp/sttdict.state", "w") as f:
+            with open(STATE_PATH, "w") as f:
                 f.write("on" if self.active else "off")
         except Exception:
             pass
@@ -216,7 +220,7 @@ def load_parakeet_model():
 
 
 def recognize_parakeet(asr_model, audio_array):
-    tmp_dir = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+    tmp_dir = tempfile.gettempdir()
     tmp_path = os.path.join(tmp_dir, f"{uuid.uuid4()}.wav")
     try:
         wav_write(tmp_path, SAMPLE_RATE, audio_array)
@@ -327,9 +331,9 @@ def print_status():
 
 
 def print_troubleshooting():
+    default_sock = os.path.join(TEMP_DIR, "sttdict.sock")
     print(
-        """
-TROUBLESHOOTING
+        f"""TROUBLESHOOTING
 
 If no text is typed:
   - Is your session X11?   (echo $XDG_SESSION_TYPE; should print x11)
@@ -348,7 +352,7 @@ If 'Dictation started!'/notifications appear, but nothing types:
   - Some rare apps block simulated typing (try gedit/leafpad for testing).
 
 If you see socket errors:
-  - Remove /tmp/sttdict.sock if it exists and restart the script.
+  - Remove {default_sock} if it exists and restart the script.
 
 If audio input fails:
   - Run with --list-devices and set --device <index>.
