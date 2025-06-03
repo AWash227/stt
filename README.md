@@ -33,6 +33,11 @@ New-Item -ItemType SymbolicLink -Path "$env:USERPROFILE\bin\stt.ps1" -Target "C:
 Then running `stt` (or `stt.ps1`) will start the application using the
 virtual environment.
 
+## Tray icon
+
+Launch `python -m tray` to run the program with a small system tray icon.
+Double-click the icon to toggle dictation mode. Right click the icon to exit.
+
 ## Building a standalone executable
 
 A simple `Makefile` target packages the application using PyInstaller:
@@ -41,7 +46,7 @@ A simple `Makefile` target packages the application using PyInstaller:
 make package
 ```
 
-This runs `pyinstaller --onefile main.py` and places the executable in the `dist/` directory.
+This runs `pyinstaller --onefile tray.py` and places the executable in the `dist/` directory.
 
 ### Windows build
 
@@ -62,10 +67,10 @@ pip install pyinstaller
 3. Build the executable:
 
 ```powershell
-pyinstaller --onefile main.py
+pyinstaller --onefile tray.py
 ```
 
-(Or run `make package` if `make` is available.) The resulting `main.exe` will appear under `dist`.
+(Or run `make package` if `make` is available.) The resulting `tray.exe` will appear under `dist`.
 
 ### GPU requirements
 
