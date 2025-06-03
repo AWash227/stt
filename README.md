@@ -29,3 +29,41 @@ New-Item -ItemType SymbolicLink -Path "$env:USERPROFILE\bin\stt.ps1" -Target "C:
 
 Then running `stt` (or `stt.ps1`) will start the application using the
 virtual environment.
+
+## Building a standalone executable
+
+A simple `Makefile` target packages the application using PyInstaller:
+
+```bash
+make package
+```
+
+This runs `pyinstaller --onefile main.py` and places the executable in the `dist/` directory.
+
+### Windows build
+
+1. Create and activate a virtual environment:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+2. Install the requirements and PyInstaller:
+
+```powershell
+pip install -r requirements.txt
+pip install pyinstaller
+```
+
+3. Build the executable:
+
+```powershell
+pyinstaller --onefile main.py
+```
+
+(Or run `make package` if `make` is available.) The resulting `main.exe` will appear under `dist`.
+
+### GPU requirements
+
+The Nemo ASR model works best with a recent NVIDIA GPU and drivers providing CUDA support. CPU inference is possible but significantly slower.
