@@ -13,6 +13,16 @@ import shutil
 import uuid
 import signal
 
+import pyperclip
+try:
+    import keyboard
+except Exception:  # noqa: E722
+    keyboard = None
+try:
+    import pyautogui
+except Exception:  # noqa: E722
+    pyautogui = None
+
 import numpy as np
 import sounddevice as sd
 from scipy.signal import resample
@@ -28,6 +38,8 @@ VAD_SENSITIVITY = 2  # 0=least, 3=most sensitive
 SAMPLE_RATE = 16000  # Parakeet expects 16kHz mono audio
 MAX_AUDIO_BUFFER_SEC = 30  # Max seconds of speech buffer before forced flush
 
+IS_WINDOWS = sys.platform.startswith("win")
+
 # ========== GLOBALS ==========
 args = None
 dict_control = None
@@ -37,6 +49,8 @@ shutdown_event = threading.Event()  # For graceful shutdown
 
 
 def warn_x11():
+    if IS_WINDOWS:
+        return
     xdg_session = os.environ.get("XDG_SESSION_TYPE", "")
     display = os.environ.get("DISPLAY", "")
     if xdg_session != "x11" or not display:
@@ -162,39 +176,49 @@ def type_text(txt, ascii_only=False):
         if filtered_txt != txt:
             print("[INFO] Some Unicode characters were omitted (ASCII-only mode).")
         txt = filtered_txt
-    if can_xdotool():
+
+    typed = False
+    if not IS_WINDOWS and can_xdotool():
         time.sleep(0.2)
         print(f"[Typed]: {txt}")
         try:
             subprocess.run(["xdotool", "type", "--delay", "0", txt])
+            typed = True
         except Exception as e:
             print(f"[ERROR] xdotool typing failed: {e}")
-            # Fallback: set clipboard (if xclip available)
-            try_clipboard(txt)
-    else:
-        print(f"[FAKE TYPE] (Not in GUI): Would have typed: {txt}")
+
+    if not typed:
+        typed = fallback_typing(txt)
+
+    if not typed:
+        print(f"[FAKE TYPE] Would have typed: {txt}")
         try_clipboard(txt)
 
 
+def fallback_typing(txt):
+    if keyboard is not None:
+        try:
+            keyboard.write(txt)
+            print(f"[Typed via keyboard]: {txt}")
+            return True
+        except Exception as e:
+            print(f"[keyboard ERROR]: {e}")
+    if pyautogui is not None:
+        try:
+            pyautogui.typewrite(txt)
+            print(f"[Typed via pyautogui]: {txt}")
+            return True
+        except Exception as e:
+            print(f"[pyautogui ERROR]: {e}")
+    return False
+
+
 def try_clipboard(txt):
-    if shutil.which("xclip"):
-        try:
-            p = subprocess.Popen(
-                ["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE
-            )
-            p.communicate(input=txt.encode())
-            print("[Clipboard]: Text copied to clipboard via xclip.")
-        except Exception as e:
-            print(f"[Clipboard ERROR]: {e}", file=sys.stderr)
-    elif shutil.which("wl-copy"):
-        try:
-            p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
-            p.communicate(input=txt.encode())
-            print("[Clipboard]: Text copied to clipboard via wl-copy.")
-        except Exception as e:
-            print(f"[Clipboard ERROR]: {e}", file=sys.stderr)
-    else:
-        print("[Clipboard]: No clipboard utility available.")
+    try:
+        pyperclip.copy(txt)
+        print("[Clipboard]: Text copied to clipboard.")
+    except Exception as e:
+        print(f"[Clipboard ERROR]: {e}", file=sys.stderr)
 
 
 # ========== STT MODEL SETUP ==========

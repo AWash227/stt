@@ -2,8 +2,10 @@
 
 A simple speech-to-text system that uses [nvidia/parakeet-tdt-0.6b-v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) under the hood. Dictation mode is toggled with a hotkey.
 
-Uses xdotool to send the text generated as keystrokes into the active application.
-Only tested on Arch Linux. Set up a keybind (e.g. `super+alt+v`) that runs:
+Uses `xdotool` on Linux to send the text generated as keystrokes. When it is
+unavailable (such as on Windows) the script falls back to the `keyboard` or
+`pyautogui` libraries. Primarily developed on Arch Linux. Set up a keybind
+(e.g. `super+alt+v`) that runs:
 
 ```
 echo "toggle" | nc -U /tmp/sttdict.sock
