@@ -8,7 +8,8 @@ unavailable (such as on Windows) the script falls back to the `keyboard` or
 (e.g. `super+alt+v`) that runs:
 
 ```
-echo "toggle" | nc -U /tmp/sttdict.sock
+SOCK=$(python -c "import tempfile, os; print(os.path.join(tempfile.gettempdir(), 'sttdict.sock'))")
+echo "toggle" | nc -U "$SOCK"
 ```
 
 Pressing it again stops dictation. If you set `STT_SOCK_PATH`, update the socket path accordingly.
