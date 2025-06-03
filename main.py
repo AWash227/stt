@@ -122,6 +122,7 @@ def socket_listener(sock_path=SOCK_PATH):
         print(f"Try deleting {sock_path} if it exists and re-run.")
         sys.exit(1)
     server.listen(1)
+    server.settimeout(1.0)  # Allow graceful shutdown
     print(f"[Dictation control socket at {sock_path}]")
 
     def loop():
@@ -142,6 +143,8 @@ def socket_listener(sock_path=SOCK_PATH):
                         print("[Dictation stopped!]")
                         try_notify("Dictation stopped!")
                 conn.close()
+            except socket.timeout:
+                continue
             except Exception as e:
                 print(f"[Socket listener error]: {e}", file=sys.stderr)
         server.close()
