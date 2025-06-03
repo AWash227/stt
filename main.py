@@ -22,7 +22,10 @@ import webrtcvad
 import nemo.collections.asr as nemo_asr
 
 # ========== CONSTANTS ==========
+USE_UNIX = hasattr(socket, "AF_UNIX")
 SOCK_PATH = os.environ.get("STT_SOCK_PATH", "/tmp/sttdict.sock")
+TCP_HOST = os.environ.get("STT_TCP_HOST", "127.0.0.1")
+TCP_PORT = int(os.environ.get("STT_TCP_PORT", "8765"))
 VOLUME_THRESHOLD = 0.01  # Adjust to filter silence
 VAD_SENSITIVITY = 2  # 0=least, 3=most sensitive
 SAMPLE_RATE = 16000  # Parakeet expects 16kHz mono audio
@@ -64,11 +67,12 @@ def try_notify(msg):
 
 
 def cleanup(sock_path=SOCK_PATH):
-    try:
-        if os.path.exists(sock_path):
-            os.remove(sock_path)
-    except Exception as e:
-        print(f"[CLEANUP ERROR]: {e}", file=sys.stderr)
+    if USE_UNIX:
+        try:
+            if os.path.exists(sock_path):
+                os.remove(sock_path)
+        except Exception as e:
+            print(f"[CLEANUP ERROR]: {e}", file=sys.stderr)
 
 
 atexit.register(cleanup)
@@ -111,19 +115,31 @@ class DictationControl:
 dict_control = DictationControl()
 
 
-def socket_listener(sock_path=SOCK_PATH):
-    cleanup(sock_path)
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        server.bind(sock_path)
-        os.chmod(sock_path, 0o600)  # Secure socket permissions
-    except OSError as e:
-        print(f"[Socket error]: {e}")
-        print(f"Try deleting {sock_path} if it exists and re-run.")
-        sys.exit(1)
+def socket_listener(sock_path=SOCK_PATH, host=TCP_HOST, port=TCP_PORT):
+    if USE_UNIX:
+        cleanup(sock_path)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            server.bind(sock_path)
+            os.chmod(sock_path, 0o600)  # Secure socket permissions
+        except OSError as e:
+            print(f"[Socket error]: {e}")
+            print(f"Try deleting {sock_path} if it exists and re-run.")
+            sys.exit(1)
+        addr_desc = sock_path
+    else:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            server.bind((host, port))
+        except OSError as e:
+            print(f"[Socket error]: {e}")
+            print(f"Could not bind TCP socket {host}:{port}")
+            sys.exit(1)
+        addr_desc = f"{host}:{port}"
+
     server.listen(1)
     server.settimeout(1.0)  # Allow graceful shutdown
-    print(f"[Dictation control socket at {sock_path}]")
+    print(f"[Dictation control socket at {addr_desc}]")
 
     def loop():
         while not shutdown_event.is_set():
@@ -349,6 +365,7 @@ If 'Dictation started!'/notifications appear, but nothing types:
 
 If you see socket errors:
   - Remove /tmp/sttdict.sock if it exists and restart the script.
+  - If using the TCP fallback, ensure nothing else is using 127.0.0.1:8765.
 
 If audio input fails:
   - Run with --list-devices and set --device <index>.

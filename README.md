@@ -3,13 +3,32 @@
 A simple speech-to-text system that uses [nvidia/parakeet-tdt-0.6b-v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) under the hood. Dictation mode is toggled with a hotkey.
 
 Uses xdotool to send the text generated as keystrokes into the active application.
-Only tested on Arch Linux. Set up a keybind (e.g. `super+alt+v`) that runs:
+Set up a keybind (e.g. `super+alt+v`) that runs one of the following commands:
 
-```
-echo "toggle" | nc -U /tmp/sttdict.sock
-```
+* **Unix socket (default on Linux/macOS)**
 
-Pressing it again stops dictation. If you set `STT_SOCK_PATH`, update the socket path accordingly.
+  ```
+  echo "toggle" | nc -U /tmp/sttdict.sock
+  ```
+
+* **TCP fallback (Windows / systems without `AF_UNIX`)**
+
+  ```
+  echo toggle | nc 127.0.0.1 8765
+  ```
+
+  If `nc`/`netcat` is unavailable, you can send the command with Python:
+
+  ```bash
+  python - <<'EOF'
+  import socket
+  s = socket.create_connection(("127.0.0.1", 8765))
+  s.sendall(b"toggle")
+  s.close()
+  EOF
+  ```
+
+Pressing it again stops dictation. If you set `STT_SOCK_PATH` or `STT_TCP_PORT`, update the paths/ports accordingly.
 
 ## Running the CLI
 
