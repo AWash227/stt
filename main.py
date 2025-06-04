@@ -24,6 +24,14 @@ try:
     import pyautogui
 except Exception:  # noqa: E722
     pyautogui = None
+try:
+    from win10toast import ToastNotifier
+except Exception:  # noqa: E722
+    ToastNotifier = None
+try:
+    from plyer import notification as plyer_notification
+except Exception:  # noqa: E722
+    plyer_notification = None
 
 import numpy as np
 import sounddevice as sd
@@ -74,11 +82,25 @@ def try_notify(msg):
     global args
     if args is not None and hasattr(args, "no_notify") and args.no_notify:
         return
-    if shutil.which("notify-send") and os.environ.get("DISPLAY"):
+    if not IS_WINDOWS and shutil.which("notify-send") and os.environ.get("DISPLAY"):
         try:
             subprocess.run(["notify-send", msg])
+            return
         except Exception as e:
             print(f"[notify-send ERROR] {e}", file=sys.stderr)
+    elif IS_WINDOWS:
+        if ToastNotifier is not None:
+            try:
+                ToastNotifier().show_toast("STT", msg, threaded=True, duration=3)
+                return
+            except Exception as e:
+                print(f"[win10toast ERROR] {e}", file=sys.stderr)
+        if plyer_notification is not None:
+            try:
+                plyer_notification.notify(title="STT", message=msg)
+                return
+            except Exception as e:
+                print(f"[plyer notification ERROR] {e}", file=sys.stderr)
 
 
 def cleanup(sock_path=SOCK_PATH):

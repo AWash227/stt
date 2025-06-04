@@ -38,6 +38,13 @@ virtual environment.
 Launch `python -m tray` to run the program with a small system tray icon.
 Double-click the icon to toggle dictation mode. Right click the icon to exit.
 
+## Notifications
+
+When dictation is toggled, the script tries to display a desktop notification.
+On Linux it uses `notify-send` if available. On Windows it looks for
+`win10toast` and falls back to `plyer` if present. Use `--no-notify` to
+disable these messages.
+
 ## Building a standalone executable
 
 A simple `Makefile` target packages the application using PyInstaller:
