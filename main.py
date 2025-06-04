@@ -91,7 +91,11 @@ def try_notify(msg):
     elif IS_WINDOWS:
         if ToastNotifier is not None:
             try:
-                ToastNotifier().show_toast("STT", msg, threaded=True, duration=3)
+                # Using threaded=False avoids issues with the background
+                # window procedure on newer Python/Windows versions.
+                ToastNotifier().show_toast(
+                    "STT", msg, threaded=False, duration=3
+                )
                 return
             except Exception as e:
                 print(f"[win10toast ERROR] {e}", file=sys.stderr)
