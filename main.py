@@ -43,6 +43,7 @@ import nemo.collections.asr as nemo_asr
 # ========== CONSTANTS ==========
 TEMP_DIR = tempfile.gettempdir()
 SOCK_PATH = os.environ.get("STT_SOCK_PATH", os.path.join(TEMP_DIR, "sttdict.sock"))
+TCP_PORT = int(os.environ.get("STT_PORT", "8765"))
 STATE_PATH = Path(TEMP_DIR) / "sttdict.state"
 VOLUME_THRESHOLD = 0.01  # Adjust to filter silence
 VAD_SENSITIVITY = 2  # 0=least, 3=most sensitive
@@ -150,22 +151,33 @@ class DictationControl:
 dict_control = DictationControl()
 
 
-def socket_listener(sock_path=SOCK_PATH):
+def socket_listener(sock_path=SOCK_PATH, port=TCP_PORT):
     cleanup(sock_path)
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        server.bind(sock_path)
+    if hasattr(socket, "AF_UNIX"):
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            os.chmod(sock_path, 0o600)  # Secure socket permissions
-        except (NotImplementedError, PermissionError):
-            pass
-    except OSError as e:
-        print(f"[Socket error]: {e}")
-        print(f"Try deleting {sock_path} if it exists and re-run.")
-        sys.exit(1)
+            server.bind(sock_path)
+            try:
+                os.chmod(sock_path, 0o600)
+            except (NotImplementedError, PermissionError):
+                pass
+        except OSError as e:
+            print(f"[Socket error]: {e}")
+            print(f"Try deleting {sock_path} if it exists and re-run.")
+            sys.exit(1)
+        bind_desc = f"unix:{sock_path}"
+    else:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            server.bind(("127.0.0.1", port))
+        except OSError as e:
+            print(f"[Socket error]: {e}")
+            print(f"Is port {port} already in use?")
+            sys.exit(1)
+        bind_desc = f"tcp://127.0.0.1:{port}"
     server.listen(1)
-    server.settimeout(1.0)  # Allow graceful shutdown
-    print(f"[Dictation control socket at {sock_path}]")
+    server.settimeout(1.0)
+    print(f"[Dictation control socket at {bind_desc}]")
 
     def loop():
         while not shutdown_event.is_set():

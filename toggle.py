@@ -7,6 +7,7 @@ SOCK_PATH = os.environ.get(
     "STT_SOCK_PATH",
     os.path.join(tempfile.gettempdir(), "sttdict.sock"),
 )
+TCP_PORT = int(os.environ.get("STT_PORT", "8765"))
 
 
 def main(argv=None):
@@ -20,9 +21,14 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    if hasattr(socket, "AF_UNIX"):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connect_addr = SOCK_PATH
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        connect_addr = ("127.0.0.1", TCP_PORT)
     try:
-        sock.connect(SOCK_PATH)
+        sock.connect(connect_addr)
         sock.sendall(args.command.encode())
     except Exception as e:
         print(f"[ERROR] {e}")
