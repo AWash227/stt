@@ -5,11 +5,12 @@ A simple speech-to-text system that uses [nvidia/parakeet-tdt-0.6b-v2](https://h
 Uses `xdotool` on Linux to send the text generated as keystrokes. When it is
 unavailable (such as on Windows) the script falls back to the `keyboard` or
 `pyautogui` libraries. Primarily developed on Arch Linux. Set up a keybind
+
 (e.g. `super+alt+v`) that runs:
 
-```
-SOCK=$(python -c "import tempfile, os; print(os.path.join(tempfile.gettempdir(), 'sttdict.sock'))")
-echo "toggle" | nc -U "$SOCK"
+```bash
+python toggle.py toggle
+# or: python -m toggle toggle
 ```
 
 Pressing it again stops dictation. If you set `STT_SOCK_PATH`, update the socket path accordingly.
