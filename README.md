@@ -14,6 +14,8 @@ python toggle.py toggle
 ```
 
 Pressing it again stops dictation. If you set `STT_SOCK_PATH`, update the socket path accordingly.
+On Windows (where Unix sockets may be unavailable), the code falls back to a
+TCP socket on `localhost:8765`. Override the port with `STT_PORT` if needed.
 
 ## Running the CLI
 
