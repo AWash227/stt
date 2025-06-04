@@ -156,7 +156,10 @@ def socket_listener(sock_path=SOCK_PATH):
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         server.bind(sock_path)
-        os.chmod(sock_path, 0o600)  # Secure socket permissions
+        try:
+            os.chmod(sock_path, 0o600)  # Secure socket permissions
+        except (NotImplementedError, PermissionError):
+            pass
     except OSError as e:
         print(f"[Socket error]: {e}")
         print(f"Try deleting {sock_path} if it exists and re-run.")
