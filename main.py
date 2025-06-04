@@ -35,7 +35,6 @@ except Exception:  # noqa: E722
 
 import numpy as np
 import sounddevice as sd
-from scipy.signal import resample
 from scipy.io.wavfile import write as wav_write
 
 import webrtcvad
