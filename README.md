@@ -1,6 +1,6 @@
 # STT (Speech To Text)
 
-A simple speech-to-text system that uses [nvidia/parakeet-tdt-0.6b-v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) under the hood. Dictation mode is toggled with a hotkey.
+A simple speech-to-text system that uses [nvidia/parakeet-tdt-0.6b-v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) under the hood. Dictation mode is toggled with a hotkey. The model is downloaded automatically the first time you run the program.
 
 Uses `xdotool` on Linux to send the text generated as keystrokes. When it is
 unavailable (such as on Windows) the script falls back to the `keyboard` or
@@ -70,6 +70,10 @@ python -m venv .venv
 pip install -r requirements.txt
 pip install pyinstaller
 ```
+
+Before running `pyinstaller`, clear any cached model files (for example under
+`~/.cache/torch` or `~/.cache/huggingface`) so the model is not bundled inside
+the executable and will be downloaded on first run.
 
 3. Build the executable:
 
