@@ -34,6 +34,21 @@ New-Item -ItemType SymbolicLink -Path "$env:USERPROFILE\bin\stt.ps1" -Target "C:
 Then running `stt` (or `stt.ps1`) will start the application using the
 virtual environment.
 
+## Windows Setup
+
+For a smooth installation on Windows, make sure you have:
+- The [Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) installed. They provide the compilers needed by some Python packages.
+- [Python 3.11.9](https://www.python.org/downloads/release/python-3119/) installed and added to your `PATH`.
+
+After installing these, open a **new** PowerShell window and verify:
+
+```powershell
+python --version
+```
+
+It should report `Python 3.11.9`.
+
+
 ## Tray icon
 
 Launch `python -m tray` to run the program with a small system tray icon.
