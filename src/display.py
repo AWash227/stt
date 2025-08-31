@@ -326,6 +326,11 @@ def start_display(
     win.move(g.x + g.width - win_size - 20, g.y + g.height - win_size - 20)
     win.set_default_size(win_size, win_size)
     voice_widget = VoiceWidget()
+    # Make blob clickable
+    try:
+        voice_widget.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+    except Exception:
+        pass
     win.add(voice_widget)
 
     def poll_all_queues():
@@ -355,9 +360,38 @@ def start_display(
 
     # Create transcript bubbles next to the blob
     try:
-        bubbles = BubblesUI(win, dict_control, narration_path="narration.jsonl", mic_control_q=mic_control_q)
+        bubbles = BubblesUI(
+            win,
+            dict_control,
+            narration_path="narration.jsonl",
+            mic_control_q=mic_control_q,
+            show_on_init=False,
+        )
     except Exception as e:
         log.error(f"Failed to init BubblesUI: {e}")
+
+    # Toggle UI on blob click
+    def on_blob_click(_widget, _event):
+        try:
+            if bubbles is None:
+                return False
+            visible = bubbles.win.get_visible()
+            if visible:
+                bubbles.win.hide()
+            else:
+                try:
+                    bubbles._place_next_to_anchor()
+                except Exception:
+                    pass
+                bubbles.win.show_all()
+        except Exception:
+            pass
+        return True
+
+    try:
+        voice_widget.connect("button-press-event", on_blob_click)
+    except Exception:
+        pass
 
     Gtk.main()
 
@@ -380,7 +414,14 @@ class TextBufferSession:
 
 
 class BubblesUI:
-    def __init__(self, anchor_win: Gtk.Window, dict_control, narration_path: str = "narration.jsonl", mic_control_q: queue.Queue | None = None):
+    def __init__(
+        self,
+        anchor_win: Gtk.Window,
+        dict_control,
+        narration_path: str = "narration.jsonl",
+        mic_control_q: queue.Queue | None = None,
+        show_on_init: bool = True,
+    ):
         self.anchor_win = anchor_win
         self.dict_control = dict_control
         self.narration_path = narration_path
@@ -668,7 +709,8 @@ class BubblesUI:
 
         # show
         self._adjust_window_size()
-        self.win.show_all()
+        if show_on_init:
+            self.win.show_all()
 
         # timers
         GLib.timeout_add(400, self._poll_tail)  # tail narration.jsonl
