@@ -78,6 +78,7 @@ class Cfg:
     FONT_SIZE_PT = 13
     TITLE_FONT_SIZE_PT = 12
     TEXT_RGBA = (0.93, 0.94, 0.96, 0.98)  # light text for dark bg
+    HISTORY_BATCH = 400  # rows per idle batch for initial load
 
 
 def ease_out_cubic(t):
@@ -363,18 +364,26 @@ class BubblesUI:
         self._dragging = False
         self._drag_origin = (0, 0)
         self._win_origin = (0, 0)
+        self._suppress_reposition = False
 
         # Window
-        self.win = Gtk.Window(Gtk.WindowType.POPUP)
+        # Use TOPLEVEL so the widget can accept keyboard focus (for SearchEntry)
+        self.win = Gtk.Window(Gtk.WindowType.TOPLEVEL)
         scr = Gdk.Screen.get_default()
         self.win.set_app_paintable(True)
         self.win.set_accept_focus(True)
+        self.win.set_focus_on_map(True)
+        self.win.set_decorated(False)
         if scr.is_composited() and scr.get_rgba_visual():
             self.win.set_visual(scr.get_rgba_visual())
         self.win.set_keep_above(True)
         self.win.set_skip_taskbar_hint(True)
         self.win.set_skip_pager_hint(True)
         self.win.set_default_size(Cfg.BUBBLE_WIDTH, Cfg.BUBBLE_HEIGHT)
+        try:
+            self.win.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        except Exception:
+            pass
 
         # Root container
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -383,7 +392,7 @@ class BubblesUI:
         root.set_margin_start(10)
         root.set_margin_end(10)
 
-        # Collapsible header (toggles the whole panel)
+        # Collapsible header (shows current buffer snippet)
         header = Gtk.EventBox()
         header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         header_box.get_style_context().add_class("chip")
@@ -393,140 +402,162 @@ class BubblesUI:
         header_box.set_margin_end(2)
         self.header_box = header_box
         self.header_icon = Gtk.Image.new_from_icon_name("pan-down-symbolic", Gtk.IconSize.MENU)
-        header_box.pack_start(self.header_icon, False, False, 0)
+        self.chev_ev = Gtk.EventBox()
+        self.chev_ev.add(self.header_icon)
+        header_box.pack_start(self.chev_ev, False, False, 0)
+        # scrolling current buffer viewer
+        self.header_scroller = Gtk.ScrolledWindow()
+        self.header_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.header_scroller.set_size_request(-1, 84)
+        self.header_scroller.set_overlay_scrolling(True)
+        self.header_scroller.set_kinetic_scrolling(True)
         self.header_label = Gtk.Label(label="Transcript")
         self.header_label.set_xalign(0.0)
         self.header_label.set_line_wrap(True)
         if Pango:
             self.header_label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        self.header_label.set_max_width_chars(42)
-        header_box.pack_start(self.header_label, True, True, 0)
+        self.header_label.set_max_width_chars(46)
+        self.header_scroller.add(self.header_label)
+        header_box.pack_start(self.header_scroller, True, True, 0)
         # small icon copy button
         self.header_copy_btn = Gtk.Button()
         self.header_copy_btn.set_relief(Gtk.ReliefStyle.NONE)
         self.header_copy_btn.set_tooltip_text("Copy current buffer")
         self.header_copy_btn.get_style_context().add_class("btn")
         self.header_copy_btn.set_image(Gtk.Image.new_from_icon_name("edit-copy-symbolic", Gtk.IconSize.MENU))
+        self.header_copy_btn.set_valign(Gtk.Align.START)
+        self.header_copy_btn.set_halign(Gtk.Align.END)
         self.header_copy_btn.connect("clicked", self._on_copy)
         header_box.pack_end(self.header_copy_btn, False, False, 0)
         header.add(header_box)
         root.pack_start(header, False, False, 0)
 
         self.main_revealer = Gtk.Revealer()
-        self.main_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
-        self.main_revealer.set_transition_duration(120)
+        self.main_revealer.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
+        self.main_revealer.set_transition_duration(240)
         self.main_revealer.set_reveal_child(False)
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
 
-        # History header + animated revealer
-        hist_header_ev = Gtk.EventBox()
-        hist_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        hist_header.set_margin_top(2)
-        hist_header.set_margin_bottom(2)
-        hist_header.set_margin_start(2)
-        hist_header.set_margin_end(2)
-        hist_header.get_style_context().add_class("subtle")
-        self.hist_icon = Gtk.Image.new_from_icon_name("pan-down-symbolic", Gtk.IconSize.MENU)
-        hist_header.pack_start(self.hist_icon, False, False, 0)
-        self.hist_label = Gtk.Label(label="History")
-        self.hist_label.set_xalign(0.0)
-        hist_header.pack_start(self.hist_label, True, True, 0)
-        hist_header_ev.add(hist_header)
-        content.pack_start(hist_header_ev, False, False, 0)
+        # History search + list (single top-level dropdown only)
+        search_frame = Gtk.Frame()
+        search_frame.set_shadow_type(Gtk.ShadowType.NONE)
+        search_frame.get_style_context().add_class("chip")
+        search_frame.set_margin_start(2)
+        search_frame.set_margin_end(2)
+        search_frame.set_margin_top(2)
+        search_frame.set_margin_bottom(4)
+        search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        search_box.set_margin_top(6)
+        search_box.set_margin_bottom(6)
+        search_box.set_margin_start(8)
+        search_box.set_margin_end(8)
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text("Search history…")
+        self.search_entry.set_can_focus(True)
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        self.search_entry.connect("changed", self._on_search_changed)
+        self.search_entry.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.search_entry.connect("button-press-event", lambda *a: (self.search_entry.grab_focus(), False)[1])
+        search_box.pack_start(self.search_entry, True, True, 0)
+        search_frame.add(search_box)
+        content.pack_start(search_frame, False, False, 0)
 
-        self.hist_revealer = Gtk.Revealer()
-        self.hist_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
-        self.hist_revealer.set_transition_duration(100)
-        self.hist_revealer.set_reveal_child(False)
-
-        # History scroller with list inside a rounded frame
+        # History scroller with TreeView (performant for large lists)
         hist_scroller = Gtk.ScrolledWindow()
-        hist_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        hist_scroller.set_propagate_natural_height(True)
-        hist_scroller.set_min_content_height(160)
+        hist_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.ALWAYS)
+        # Let the scroller take remaining height; do not propagate child's natural height
+        hist_scroller.set_propagate_natural_height(False)
+        hist_scroller.set_min_content_height(220)
         hist_scroller.set_vexpand(True)
-        self.listbox = Gtk.ListBox()
-        self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.listbox.set_activate_on_single_click(True)
-        self.listbox.connect("row-activated", self._on_history_activate)
-        self.listbox.set_header_func(self._list_header_func, None)
-        self.listbox.set_vexpand(True)
-        hist_scroller.add(self.listbox)
+        hist_scroller.set_overlay_scrolling(True)
+        hist_scroller.set_kinetic_scrolling(True)
+        hist_scroller.set_hexpand(True)
+
+        # Model: time_str, excerpt, full_text
+        self.hist_store = Gtk.ListStore(str, str, str)
+        self._search_query = ""
+        self.hist_filter = self.hist_store.filter_new()
+        self.hist_filter.set_visible_func(self._hist_visible_func)
+        self.hist_view = Gtk.TreeView(model=self.hist_filter)
+        self.hist_view.set_headers_visible(False)
+        self.hist_view.set_enable_search(False)
+        self.hist_view.set_fixed_height_mode(True)
+        self.hist_view.set_vexpand(True)
+        self.hist_view.set_hexpand(True)
+        # Columns
+        time_renderer = Gtk.CellRendererText()
+        time_renderer.set_property("foreground", "#D0D6DE")
+        time_renderer.set_property("scale", 0.85)
+        time_col = Gtk.TreeViewColumn("time", time_renderer, text=0)
+        time_col.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+        time_col.set_fixed_width(64)
+
+        text_renderer = Gtk.CellRendererText()
+        text_renderer.set_property("ellipsize", Pango.EllipsizeMode.END if Pango else 3)
+        text_renderer.set_property("foreground", "#FFFFFF")
+        text_col = Gtk.TreeViewColumn("text", text_renderer, text=1)
+        text_col.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+        self.hist_view.append_column(time_col)
+        text_col.set_expand(True)
+        self.hist_view.append_column(text_col)
+        try:
+            self.hist_view.set_tooltip_column(2)  # show full text on hover
+        except Exception:
+            pass
+        self.hist_view.connect("row-activated", self._on_hist_row_activated)
+        self.hist_selection = self.hist_view.get_selection()
+        self.hist_selection.set_mode(Gtk.SelectionMode.SINGLE)
+        self.hist_selection.connect("changed", self._on_hist_selection_changed)
+        # keep references for dynamic sizing
+        self._hist_time_col = time_col
+        self._hist_text_col = text_col
+        self.hist_view.connect("size-allocate", self._on_hist_size_allocate)
+
+        hist_scroller.add(self.hist_view)
         hist_frame = Gtk.Frame()
         hist_frame.set_shadow_type(Gtk.ShadowType.NONE)
-        hist_frame.get_style_context().add_class("bubble")
+        hist_frame.get_style_context().add_class("chip")
         hist_frame.set_margin_start(2)
         hist_frame.set_margin_end(2)
         hist_frame.set_margin_top(2)
         hist_frame.set_margin_bottom(2)
         hist_frame.add(hist_scroller)
-        self.hist_revealer.add(hist_frame)
-        content.pack_start(self.hist_revealer, True, True, 0)
+        content.pack_start(hist_frame, True, True, 0)
 
-        # Active bubble
-        active_frame = Gtk.Frame()
-        active_frame.set_shadow_type(Gtk.ShadowType.NONE)
-        active_frame.get_style_context().add_class("bubble")
-
-        active_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        active_box.set_margin_top(12)
-        active_box.set_margin_bottom(12)
-        active_box.set_margin_start(12)
-        active_box.set_margin_end(12)
-
-        # Active editor (no separate title; header acts as visualiser)
-
-        self.textview = Gtk.TextView()
-        self.textview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self.textview.set_editable(False)
-        self.textview.set_cursor_visible(False)
-        self.textview.set_left_margin(8)
-        self.textview.set_right_margin(8)
-        self.textview.connect("button-press-event", self._on_active_click)
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroller.add(self.textview)
-        active_box.pack_start(scroller, True, True, 0)
-
-        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.copy_btn = Gtk.Button()
-        self.copy_btn.set_relief(Gtk.ReliefStyle.NONE)
-        self.copy_btn.set_tooltip_text("Copy current buffer")
-        self.copy_btn.get_style_context().add_class("btn")
-        self.copy_btn.set_image(Gtk.Image.new_from_icon_name("edit-copy-symbolic", Gtk.IconSize.MENU))
-        self.copy_btn.connect("clicked", self._on_copy)
-        self.done_btn = Gtk.Button(label="Done")
-        self.done_btn.connect("clicked", self._on_done)
-        self.done_btn.set_no_show_all(True)
-        self.done_btn.hide()
-        btn_box.pack_start(self.copy_btn, False, False, 0)
-        btn_box.pack_end(self.done_btn, False, False, 0)
-        active_box.pack_start(btn_box, False, False, 0)
-
-        active_frame.add(active_box)
-        content.pack_end(active_frame, True, True, 0)
+        # (Removed bottom current buffer editor; header acts as viewer)
 
         self.main_revealer.add(content)
         root.pack_end(self.main_revealer, True, True, 0)
 
-        # Wire header toggles
-        # enable drag + toggle on release
+        # Wire header interactions
+        # drag on header background, toggle only on chevron
         header.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.POINTER_MOTION_MASK)
         header.connect("button-press-event", self._on_header_press)
         header.connect("motion-notify-event", self._on_header_motion)
         header.connect("button-release-event", self._on_header_release)
-        hist_header_ev.connect("button-release-event", self._toggle_history)
+        self.chev_ev.connect("button-release-event", self._toggle_main)
         # enable drag move via header press
 
         self.win.add(root)
         self._install_css()
 
-        # Populate history and position window
-        self._load_history_from_file()
+        # Populate history (incremental) and position window
+        self._start_history_load()
         self._ensure_active_session()
-        self._refresh_history_list()
         self._update_active_view()
+
+        # header autoscroll logic
+        try:
+            self._header_autoscroll = True
+            vadj = self.header_scroller.get_vadjustment()
+            def on_vadj_changed(adj):
+                # if user is near bottom -> keep autoscrolling
+                at_bottom = (adj.get_upper() - (adj.get_value() + adj.get_page_size())) < 8
+                self._header_autoscroll = at_bottom
+            vadj.connect("value-changed", on_vadj_changed)
+        except Exception:
+            pass
 
         # show
         self._adjust_window_size()
@@ -562,16 +593,16 @@ class BubblesUI:
             color: rgba(210,212,216,0.8);
         }}
         textview, textview text, label {{
-            color: rgba(238,240,243,0.98);
+            color: rgba(250,252,255,0.98);
         }}
         button.btn {{
             background: rgba(255,255,255,0.06);
             border: 1px solid rgba(255,255,255,0.28);
             color: rgba(238,240,243,0.98);
             border-radius: 10px;
-            padding: 2px 6px;
-            min-height: 0;
-            min-width: 0;
+            padding: 2px 4px;
+            min-height: 24px;
+            min-width: 24px;
         }}
         button.btn:hover {{
             background: rgba(255,255,255,0.10);
@@ -579,12 +610,18 @@ class BubblesUI:
         scrolledwindow, viewport {{
             background-color: transparent;
         }}
-        frame.bubble > border {{
+        treeview, treeview.view {{
+            background-color: transparent;
+        }}
+        entry, searchentry {{
+            color: rgba(255,255,255,0.98);
+            background-color: transparent;
+            border: none;
+        }}
+        frame.bubble > border, frame.chip > border {{
             border-radius: 18px;
         }}
-        list row {{
-            padding: 4px 6px;
-        }}
+        /* TreeView rows are compact by default; no extra padding here */
         """
         css.load_from_data(css_str.encode("utf-8"))
         screen = Gdk.Screen.get_default()
@@ -593,41 +630,71 @@ class BubblesUI:
         )
 
     # ---------- History and tailing ----------
-    def _load_history_from_file(self):
-        if not os.path.exists(self.narration_path):
+    def _start_history_load(self):
+        self.hist_store.clear()
+        self.history = []
+        self._initial_loader = self._iter_history_lines()
+        GLib.idle_add(self._history_batch)
+
+    def _iter_history_lines(self):
+        path = self.narration_path
+        if not os.path.exists(path):
             self._file_pos = 0
             return
-        sessions: list[TextBufferSession] = []
         try:
-            with open(self.narration_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-                self._file_pos = f.tell()
-        except Exception:
-            lines = []
-        cur: TextBufferSession | None = None
-        prev_ts = None
-        for ln in lines[-10000:]:  # limit to last 10k lines for speed
+            with open(path, "r", encoding="utf-8") as f:
+                for ln in f:
+                    try:
+                        obj = json.loads(ln)
+                        ts = float(obj.get("timestamp", time.time()))
+                        txt = str(obj.get("text", "")).strip()
+                    except Exception:
+                        continue
+                    if not txt:
+                        continue
+                    tstr = time.strftime("%H:%M:%S", time.localtime(ts))
+                    yield (tstr, txt, ts)
+            # after initial load, set file pos to EOF
             try:
-                obj = json.loads(ln)
-                ts = float(obj.get("timestamp", time.time()))
-                txt = str(obj.get("text", "")).strip()
+                self._file_pos = os.path.getsize(path)
             except Exception:
-                continue
-            if not txt:
-                continue
-            if prev_ts is None or (ts - prev_ts) > Cfg.SESSION_GAP_SEC:
-                # new session
-                if cur and cur.text.strip():
-                    sessions.append(cur)
-                cur = TextBufferSession(created_ts=ts, text="")
-            prev_ts = ts
-            if cur is None:
-                cur = TextBufferSession(created_ts=ts, text="")
-            cur.text = (cur.text + (" " if cur.text else "") + txt).strip()
-        if cur and cur.text.strip():
-            sessions.append(cur)
-        # keep only recent
-        self.history = sessions[-Cfg.MAX_HISTORY_ITEMS:]
+                self._file_pos = 0
+        except Exception:
+            return
+
+    def _history_batch(self):
+        # Load in idle batches for responsiveness
+        count = 0
+        batch = Cfg.HISTORY_BATCH
+        if not hasattr(self, "_initial_loader") or self._initial_loader is None:
+            return False
+        for tstr, txt, ts in self._initial_loader:
+            # column 1 shows the full text (renderer ellipsizes visually)
+            self.hist_store.append([tstr, txt, txt])
+            self.history.append(TextBufferSession(created_ts=ts, text=txt))
+            count += 1
+            if count >= batch:
+                return True  # keep going next idle
+        # done
+        self._initial_loader = None
+        return False
+
+    def _hist_visible_func(self, model, itr, data=None):
+        # Filter rows by search query (case-insensitive substring)
+        q = getattr(self, "_search_query", "").strip().lower()
+        if not q:
+            return True
+        time_str = (model.get_value(itr, 0) or "").lower()
+        excerpt = (model.get_value(itr, 1) or "").lower()
+        full = (model.get_value(itr, 2) or "").lower()
+        return q in time_str or q in excerpt or q in full
+
+    def _on_search_changed(self, entry):
+        self._search_query = entry.get_text().strip()
+        try:
+            self.hist_filter.refilter()
+        except Exception:
+            pass
 
     def _poll_tail(self):
         try:
@@ -643,6 +710,7 @@ class BubblesUI:
             try:
                 obj = json.loads(ln)
                 txt = str(obj.get("text", "")).strip()
+                ts = float(obj.get("timestamp", time.time()))
             except Exception:
                 txt = ""
             if not txt:
@@ -652,6 +720,10 @@ class BubblesUI:
                 self._ensure_active_session()
                 if self.active:
                     self.active.text = (self.active.text + (" " if self.active.text else "") + txt).strip()
+            # Also reflect in history model as its own entry (performant append)
+            tstr = time.strftime("%H:%M:%S", time.localtime(ts))
+            self.hist_store.append([tstr, txt, txt])
+            self.history.append(TextBufferSession(created_ts=ts, text=txt))
         self._update_active_view()
         return True
 
@@ -663,10 +735,6 @@ class BubblesUI:
             self._update_active_view()
         elif (not now_active) and self._was_active:
             # ended → push to history
-            if self.active and self.active.text.strip():
-                self.history.append(self.active)
-                self.history = self.history[-Cfg.MAX_HISTORY_ITEMS:]
-                self._refresh_history_list()
             self.active = None
             self._update_active_view()
         self._was_active = now_active
@@ -677,81 +745,50 @@ class BubblesUI:
             self.active = TextBufferSession()
 
     # ---------- UI helpers ----------
-    def _refresh_history_list(self):
-        # clear
-        for row in list(self.listbox.get_children()):
-            self.listbox.remove(row)
-        for sess in reversed(self.history):  # newest first
-            row = Gtk.ListBoxRow()
-            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            box.set_margin_top(2)
-            box.set_margin_bottom(2)
-            box.set_margin_start(6)
-            box.set_margin_end(6)
-            # Left: title + excerpt hierarchy
-            left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            t_lbl = Gtk.Label(label=time.strftime("%H:%M:%S", time.localtime(sess.created_ts)))
-            t_lbl.set_xalign(0.0)
-            t_lbl.get_style_context().add_class("secondary")
-            if Pango:
-                attrs = Pango.AttrList()
-                attrs.insert(Pango.attr_size_new(int(Pango.SCALE * 9)))
-                t_lbl.set_attributes(attrs)
-            excerpt = sess.text.strip().split("\n", 1)[0]
-            if Pango:
-                ex_lbl = Gtk.Label()
-                ex_lbl.set_xalign(0.0)
-                ex_lbl.set_ellipsize(Pango.EllipsizeMode.END)
-                ex_lbl.set_max_width_chars(40)
-                ex_lbl.set_text(excerpt)
-            else:
-                ex_lbl = Gtk.Label(label=excerpt)
-                ex_lbl.set_xalign(0.0)
-            left.pack_start(t_lbl, False, False, 0)
-            left.pack_start(ex_lbl, False, False, 0)
-            box.pack_start(left, True, True, 0)
-            # Right: copy button
-            copy_btn = Gtk.Button()
-            copy_btn.set_relief(Gtk.ReliefStyle.NONE)
-            copy_btn.get_style_context().add_class("btn")
-            copy_btn.set_tooltip_text("Copy")
-            copy_btn.set_image(Gtk.Image.new_from_icon_name("edit-copy-symbolic", Gtk.IconSize.MENU))
-            copy_btn.connect("clicked", self._on_copy_history, sess)
-            box.pack_end(copy_btn, False, False, 0)
-            row.add(box)
-            row.sess = sess  # attach
-            self.listbox.add(row)
-        self.listbox.show_all()
 
     def _update_active_view(self):
-        buf = self.textview.get_buffer()
-        cur_text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
         new_text = self.active.text if self.active else ""
-        if cur_text != new_text:
-            buf.set_text(new_text)
-        # Header summary line for collapsed view
-        snippet = (new_text.strip().split("\n", 1)[0] if new_text else "")
-        if Pango:
-            if len(snippet) > 60:
-                snippet = snippet[:57] + "…"
-        self.header_label.set_text(snippet if snippet else "Transcript")
+        # Update header viewer text (full), scroller will clip top (show latest)
+        if self.header_label.get_text() != (new_text or ""):
+            self.header_label.set_text(new_text or "Transcript")
+        # Autoscroll to the end unless user scrolled up
+        try:
+            vadj = self.header_scroller.get_vadjustment()
+            if getattr(self, "_header_autoscroll", True):
+                GLib.idle_add(lambda: vadj.set_value(max(0, vadj.get_upper() - vadj.get_page_size())))
+        except Exception:
+            pass
 
-    def _on_history_activate(self, listbox, row):
-        sess = getattr(row, "sess", None)
-        if not sess:
+    def _on_hist_row_activated(self, tree, path, col):
+        model = tree.get_model()  # filter model
+        itr = model.get_iter(path)
+        if not itr:
             return
-        # save current active
-        if self.active and self.active.text.strip():
-            self.history.append(self.active)
-            self.history = self.history[-Cfg.MAX_HISTORY_ITEMS:]
-        # copy into new active
-        self.active = TextBufferSession(text=sess.text)
-        self._refresh_history_list()
+        full_text = model.get_value(itr, 2)
+        self.active = TextBufferSession(text=full_text)
         self._update_active_view()
 
+    def _on_hist_selection_changed(self, selection):
+        model, itr = selection.get_selected()  # model is filter
+        if itr is None:
+            return
+        full_text = model.get_value(itr, 2)
+        self.active = TextBufferSession(text=full_text)
+        self._update_active_view()
+
+    def _on_hist_size_allocate(self, widget, allocation):
+        try:
+            total_w = allocation.width
+            time_w = self._hist_time_col.get_fixed_width() if hasattr(self, '_hist_time_col') and self._hist_time_col else 64
+            padding = 24  # scrollbar + margins slack
+            text_w = max(60, total_w - time_w - padding)
+            if hasattr(self, '_hist_text_col') and self._hist_text_col:
+                self._hist_text_col.set_fixed_width(text_w)
+        except Exception:
+            pass
+
     def _on_copy(self, *_):
-        buf = self.textview.get_buffer()
-        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        text = (self.active.text if self.active else "")
         clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
         clipboard.set_text(text, -1)
 
@@ -759,24 +796,7 @@ class BubblesUI:
         clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
         clipboard.set_text(sess.text, -1)
 
-    def _on_active_click(self, *_):
-        # make editable
-        self.textview.set_editable(True)
-        self.textview.set_cursor_visible(True)
-        self.done_btn.show()
-        self.done_btn.set_no_show_all(False)
-
-    def _on_done(self, *_):
-        # save edits back to active
-        buf = self.textview.get_buffer()
-        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
-        if self.active is None:
-            self.active = TextBufferSession(text=text)
-        else:
-            self.active.text = text
-        self.textview.set_editable(False)
-        self.textview.set_cursor_visible(False)
-        self.done_btn.hide()
+    # removed editing handlers (editor removed)
 
     # ---------- Positioning ----------
     def _place_next_to_anchor(self):
@@ -835,6 +855,8 @@ class BubblesUI:
         return False
 
     def _reposition(self, *_args):
+        if self._suppress_reposition:
+            return False
         if not getattr(self, '_user_moved', False):
             GLib.idle_add(self._place_next_to_anchor)
         return False
@@ -859,7 +881,12 @@ class BubblesUI:
         except Exception:
             pass
         GLib.idle_add(self._adjust_window_size)
-        GLib.idle_add(self._place_next_to_anchor)
+        if not cur:
+            # just expanded -> focus search for quick filtering
+            try:
+                self.search_entry.grab_focus()
+            except Exception:
+                pass
 
     def _toggle_history(self, *_):
         cur = self.hist_revealer.get_reveal_child()
@@ -872,10 +899,10 @@ class BubblesUI:
         except Exception:
             pass
         GLib.idle_add(self._adjust_window_size)
-        GLib.idle_add(self._place_next_to_anchor)
 
     def _adjust_window_size(self):
         # When collapsed, shrink to header; when expanded, use target size.
+        self._suppress_reposition = True
         expanded = self.main_revealer.get_reveal_child()
         if not expanded:
             w_min, w_nat = self.header_box.get_preferred_width()
@@ -885,6 +912,11 @@ class BubblesUI:
             self.win.resize(w, h)
         else:
             self.win.resize(Cfg.BUBBLE_WIDTH, Cfg.BUBBLE_HEIGHT)
+        GLib.timeout_add(50, self._clear_reposition_suppression)
+        return False
+
+    def _clear_reposition_suppression(self):
+        self._suppress_reposition = False
         return False
 
     def _on_header_press(self, _widget, event):
@@ -915,9 +947,5 @@ class BubblesUI:
             return False
         was_dragging = self._dragging
         self._dragging = False
-        if was_dragging:
-            # do not toggle if it was a drag
-            return True
-        # treat as click -> toggle
-        self._toggle_main()
-        return True
+        # do not toggle here; chevron handles toggling
+        return was_dragging
