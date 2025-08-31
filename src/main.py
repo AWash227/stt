@@ -46,6 +46,7 @@ def main():
     monitor_q = queue.Queue()
     vad_event_q = queue.Queue()
     pipeline_event_q = queue.Queue()
+    mic_control_q = queue.Queue()
     # ────────────────────────────────
 
     dict_control = control.DictationControl()
@@ -54,7 +55,9 @@ def main():
     # Mic
     threads.append(
         threading.Thread(
-            target=mic.worker, args=(audio_q, monitor_q, shutdown_event), name="Mic"
+            target=mic.worker,
+            args=(audio_q, monitor_q, shutdown_event, mic_control_q),
+            name="Mic",
         )
     )
 
@@ -117,7 +120,7 @@ def main():
         threads.append(
             threading.Thread(
                 target=display.start_display,
-                args=(monitor_q, vad_event_q, pipeline_event_q, dict_control),
+                args=(monitor_q, vad_event_q, pipeline_event_q, dict_control, mic_control_q),
                 name="Display",
             )
         )

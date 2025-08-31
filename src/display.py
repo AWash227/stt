@@ -9,6 +9,10 @@ try:
     from gi.repository import Pango
 except Exception:
     Pango = None
+try:
+    import sounddevice as sd  # for audio device listing
+except Exception:
+    sd = None
 import cairo
 
 log = logging.getLogger(__name__)
@@ -306,6 +310,7 @@ def start_display(
     vad_q: queue.Queue,
     pipeline_event_q: queue.Queue,
     dict_control,
+    mic_control_q: queue.Queue | None = None,
 ):
     scr = Gdk.Screen.get_default()
     win = Gtk.Window(Gtk.WindowType.POPUP)
@@ -350,7 +355,7 @@ def start_display(
 
     # Create transcript bubbles next to the blob
     try:
-        bubbles = BubblesUI(win, dict_control, narration_path="narration.jsonl")
+        bubbles = BubblesUI(win, dict_control, narration_path="narration.jsonl", mic_control_q=mic_control_q)
     except Exception as e:
         log.error(f"Failed to init BubblesUI: {e}")
 
@@ -375,10 +380,11 @@ class TextBufferSession:
 
 
 class BubblesUI:
-    def __init__(self, anchor_win: Gtk.Window, dict_control, narration_path: str = "narration.jsonl"):
+    def __init__(self, anchor_win: Gtk.Window, dict_control, narration_path: str = "narration.jsonl", mic_control_q: queue.Queue | None = None):
         self.anchor_win = anchor_win
         self.dict_control = dict_control
         self.narration_path = narration_path
+        self.mic_control_q = mic_control_q
         self.history: list[TextBufferSession] = []
         self.active: TextBufferSession | None = None
         self._file_pos = 0
@@ -489,6 +495,40 @@ class BubblesUI:
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
 
+        # Audio source selector (minimal)
+        src_frame = Gtk.Frame()
+        src_frame.set_shadow_type(Gtk.ShadowType.NONE)
+        src_frame.get_style_context().add_class("chip")
+        src_frame.set_margin_start(2)
+        src_frame.set_margin_end(2)
+        src_frame.set_margin_top(2)
+        src_frame.set_margin_bottom(4)
+        src_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        src_box.set_margin_top(6)
+        src_box.set_margin_bottom(6)
+        src_box.set_margin_start(8)
+        src_box.set_margin_end(8)
+        src_label = Gtk.Label(label="Audio Source")
+        src_label.get_style_context().add_class("secondary")
+        src_label.set_xalign(0.0)
+        src_box.pack_start(src_label, False, False, 0)
+        self.src_combo = Gtk.ComboBoxText()
+        self.src_combo.set_hexpand(True)
+        self.src_combo.connect("changed", self._on_source_changed)
+        src_box.pack_start(self.src_combo, True, True, 0)
+        self.src_refresh_btn = Gtk.Button()
+        self.src_refresh_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.src_refresh_btn.get_style_context().add_class("btn")
+        self.src_refresh_btn.set_tooltip_text("Refresh devices")
+        try:
+            self.src_refresh_btn.set_image(Gtk.Image.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.MENU))
+        except Exception:
+            pass
+        self.src_refresh_btn.connect("clicked", lambda *_: self._refresh_audio_sources())
+        src_box.pack_end(self.src_refresh_btn, False, False, 0)
+        src_frame.add(src_box)
+        content.pack_start(src_frame, False, False, 0)
+
         # History search + list (single top-level dropdown only)
         search_frame = Gtk.Frame()
         search_frame.set_shadow_type(Gtk.ShadowType.NONE)
@@ -512,6 +552,8 @@ class BubblesUI:
         search_box.pack_start(self.search_entry, True, True, 0)
         search_frame.add(search_box)
         content.pack_start(search_frame, False, False, 0)
+
+        # (Removed Actions panel in favor of audio source selector)
 
         # History scroller with TreeView (performant for large lists)
         hist_scroller = Gtk.ScrolledWindow()
@@ -704,6 +746,8 @@ class BubblesUI:
         self.history = []
         self._initial_loader = self._iter_history_lines()
         GLib.idle_add(self._history_batch)
+        # Populate audio sources once UI is up
+        GLib.idle_add(self._refresh_audio_sources)
 
     def _iter_history_lines(self):
         path = self.narration_path
@@ -798,6 +842,55 @@ class BubblesUI:
         except Exception:
             pass
 
+    # ---------- Audio source selection ----------
+    def _refresh_audio_sources(self):
+        if getattr(self, 'src_combo', None) is None:
+            return False
+        self.src_combo.get_model().clear()
+        if sd is None:
+            self.src_combo.append_text("(sounddevice not available)")
+            self.src_combo.set_active(0)
+            return False
+        try:
+            devs = sd.query_devices()
+        except Exception as e:
+            self.src_combo.append_text(f"(device query failed)")
+            self.src_combo.set_active(0)
+            return False
+        count = 0
+        for i, d in enumerate(devs):
+            if d.get('max_input_channels', 0) <= 0:
+                continue
+            name = d.get('name', f'Device {i}')
+            label = name
+            low = name.lower()
+            if 'monitor' in low or 'loopback' in low:
+                label += "  • system output"
+            self.src_combo.append_text(f"#{i}  {label}")
+            count += 1
+        if count == 0:
+            self.src_combo.append_text("(no input devices)")
+            self.src_combo.set_active(0)
+        else:
+            self.src_combo.set_active(0)
+        return False
+
+    def _on_source_changed(self, combo):
+        if self.mic_control_q is None:
+            return
+        txt = combo.get_active_text() or ""
+        # Expect a leading '#<idx>'
+        try:
+            if txt.startswith('#'):
+                idx_str = txt.split()[0][1:]
+                idx = int(idx_str)
+                try:
+                    self.mic_control_q.put(("set_device_index", idx))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _poll_tail(self):
         # Handle file truncation/rotation gracefully
         try:
@@ -852,6 +945,8 @@ class BubblesUI:
         self._update_active_view()
         GLib.idle_add(self._scroll_hist_to_bottom)
         return True
+
+    # (Actions extraction removed)
 
     def _track_active_toggle(self):
         now_active = self.dict_control.is_active() if self.dict_control else False

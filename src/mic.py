@@ -75,32 +75,91 @@ def _make_callback(sr_in: int, audio_q: queue.Queue, monitor_q: queue.Queue | No
 #  Worker thread
 # ────────────────────────────────────────
 def worker(
-    audio_q: queue.Queue, monitor_q: queue.Queue, shutdown_event: threading.Event
+    audio_q: queue.Queue,
+    monitor_q: queue.Queue,
+    shutdown_event: threading.Event,
+    control_q: queue.Queue | None = None,
 ):
 
-    try:
-        dev_idx = config.Audio.INPUT_DEVICE_INDEX or sd.default.device[0]
-        info = sd.query_devices(dev_idx, "input")
-        sr_in = int(info["default_samplerate"])
-        block = int(sr_in * FRAME_MS / 1000)
+    def pick_initial_device():
+        try:
+            if config.Audio.INPUT_DEVICE_INDEX is not None:
+                return int(config.Audio.INPUT_DEVICE_INDEX)
+        except Exception:
+            pass
+        try:
+            # default input index
+            return sd.default.device[0]
+        except Exception:
+            return None
 
-        stream = sd.InputStream(
-            device=dev_idx,
-            channels=1,
-            samplerate=sr_in,
-            dtype="float32",
-            blocksize=block,
-            callback=_make_callback(sr_in, audio_q, monitor_q),
-        )
+    current_dev = pick_initial_device()
 
-        with stream:
-            log.info(
-                f"[mic] Device '{info['name']}' – {sr_in} Hz "
-                f"(→ {TARGET_SR} Hz), {FRAME_MS} ms frames"
+    while not shutdown_event.is_set():
+        try:
+            if current_dev is None:
+                # pick any valid input device
+                devs = sd.query_devices()
+                input_idxs = [i for i, d in enumerate(devs) if d.get("max_input_channels", 0) > 0]
+                current_dev = input_idxs[0] if input_idxs else None
+                if current_dev is None:
+                    raise RuntimeError("No input devices available")
+
+            info = sd.query_devices(current_dev, "input")
+            sr_in = int(info["default_samplerate"])
+            block = int(sr_in * FRAME_MS / 1000)
+
+            stream = sd.InputStream(
+                device=current_dev,
+                channels=1,
+                samplerate=sr_in,
+                dtype="float32",
+                blocksize=block,
+                callback=_make_callback(sr_in, audio_q, monitor_q),
             )
-            while not shutdown_event.is_set():
-                time.sleep(0.02)
 
-    except Exception as e:
-        log.error(f"[mic] Fatal: {e}", exc_info=True)
-        shutdown_event.set()
+            with stream:
+                log.info(
+                    f"[mic] Device '{info['name']}' – {sr_in} Hz "
+                    f"(→ {TARGET_SR} Hz), {FRAME_MS} ms frames"
+                )
+                # Poll for control messages or shutdown
+                while not shutdown_event.is_set():
+                    # Handle device switch commands
+                    if control_q is not None:
+                        try:
+                            cmd, payload = control_q.get(timeout=0.2)
+                            if cmd == "set_device_index":
+                                try:
+                                    new_idx = int(payload)
+                                    if new_idx != current_dev:
+                                        log.info(f"[mic] Switching device → index {new_idx}")
+                                        current_dev = new_idx
+                                        break  # exit stream and reopen
+                                except Exception:
+                                    log.warning(f"[mic] Invalid device index: {payload}")
+                            elif cmd == "set_device_name":
+                                # Try resolve by name substring
+                                try:
+                                    devs = sd.query_devices()
+                                    match = None
+                                    for i, d in enumerate(devs):
+                                        if d.get("max_input_channels", 0) > 0 and payload.lower() in d.get("name", "").lower():
+                                            match = i
+                                            break
+                                    if match is not None and match != current_dev:
+                                        log.info(f"[mic] Switching device → '{devs[match]['name']}' (#{match})")
+                                        current_dev = match
+                                        break
+                                except Exception:
+                                    log.warning(f"[mic] Could not match name: {payload}")
+                        except queue.Empty:
+                            pass
+                    time.sleep(0.02)
+        except Exception as e:
+            log.error(f"[mic] Fatal: {e}", exc_info=True)
+            time.sleep(0.5)
+            # retry
+            continue
+
+    shutdown_event.set()

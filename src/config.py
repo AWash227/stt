@@ -54,7 +54,7 @@ class VAD:
 
 
 class ASR:
-    MODEL_PATH = str(MODEL_DIR / "parakeet-tdt-0.6b-v2.nemo")
+    MODEL_PATH = str(MODEL_DIR / "parakeet-tdt-0.6b-v3.nemo")
 
 
 class LLM:
