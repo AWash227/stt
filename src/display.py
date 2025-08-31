@@ -103,6 +103,13 @@ class Tween:
         self.easing_fn = ease
 
     def set(self, val, dur):
+        # Defensive: handle None, NaN, and negative durations gracefully
+        if dur is None:
+            dur = 0
+        try:
+            dur = float(dur)
+        except Exception:
+            dur = 0.0
         if dur <= 0:
             self.value = val
             self.elapsed = self.duration
@@ -159,11 +166,13 @@ class VoiceWidget(Gtk.DrawingArea):
         return True
 
     def _on_draw(self, w, cr):
-        alpha = self.tweens["master_alpha"].value
+        alpha = float(self.tweens["master_alpha"].value)
         if alpha < 0.01:
-            return
-        width = self.get_allocated_width()
-        height = self.get_allocated_height()
+            return False
+        width = int(self.get_allocated_width())
+        height = int(self.get_allocated_height())
+        if width <= 0 or height <= 0:
+            return False
         cx, cy = width / 2.0, height / 2.0
 
         ripple_alpha = self.tweens["success_ripple_alpha"].value
@@ -176,7 +185,7 @@ class VoiceWidget(Gtk.DrawingArea):
             cr.set_source_rgba(
                 *Cfg.SUCCESS_RIPPLE[:3], Cfg.SUCCESS_RIPPLE[3] * ripple_alpha
             )
-            cr.set_line_width(Cfg.SUCCESS_RIPPLE_WIDTH * (1 - t**2))
+            cr.set_line_width(max(0.5, Cfg.SUCCESS_RIPPLE_WIDTH * (1 - t**2)))
             cr.arc(cx, cy, radius, 0, 2 * math.pi)
             cr.stroke()
 
@@ -214,6 +223,7 @@ class VoiceWidget(Gtk.DrawingArea):
         cr.set_source_rgba(*Cfg.CORE_LINE)
         cr.set_line_width(1.5)
         cr.stroke()
+        return False
 
     def set_app_state(self, new_state):
         if self.state == new_state:
@@ -238,16 +248,25 @@ class VoiceWidget(Gtk.DrawingArea):
             )
 
     def process_audio_chunk(self, audio_chunk):
-        if len(audio_chunk) == 0:
+        # Accept lists, tuples, numpy arrays; coerce safely to float32 array
+        try:
+            arr = np.asarray(audio_chunk, dtype=np.float32)
+        except Exception:
+            arr = np.zeros(1, dtype=np.float32)
+        if arr.size == 0:
             return
-        rms = min(1.0, np.sqrt(np.mean(audio_chunk**2)) * Cfg.SWELL_SENSITIVITY)
+        # Guard against NaNs/Infs propagating through
+        if not np.isfinite(arr).any():
+            return
+        arr = np.nan_to_num(arr, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
+        rms = float(min(1.0, np.sqrt(np.mean(arr**2)) * Cfg.SWELL_SENSITIVITY))
         if rms > self.dynamic_swell:
             self.dynamic_swell = self.dynamic_swell * self.swell_attack_const + rms * (
                 1 - self.swell_attack_const
             )
         else:
             self.dynamic_swell = self.dynamic_swell * self.swell_release_const
-        peak = min(1.0, np.max(np.abs(audio_chunk)) * Cfg.FIZZ_SENSITIVITY)
+        peak = float(min(1.0, np.max(np.abs(arr)) * Cfg.FIZZ_SENSITIVITY))
         if peak > self.dynamic_fizz:
             self.dynamic_fizz = self.dynamic_fizz * self.fizz_attack_const + peak * (
                 1 - self.fizz_attack_const
@@ -317,7 +336,11 @@ def start_display(
         return True
 
     def poll_dictation_control():
-        voice_widget.set_active(dict_control.is_active())
+        try:
+            active = dict_control.is_active() if dict_control else False
+        except Exception:
+            active = False
+        voice_widget.set_active(active)
         return True
 
     GLib.timeout_add(1000 // Cfg.REFRESH_HZ, poll_all_queues)
@@ -365,6 +388,15 @@ class BubblesUI:
         self._drag_origin = (0, 0)
         self._win_origin = (0, 0)
         self._suppress_reposition = False
+        # Active editor buffer (shared model)
+        self.active_buffer: Gtk.TextBuffer | None = Gtk.TextBuffer()
+        self._editor_has_focus = False
+        # Neovim/VTE integration state
+        self._nvim_tmp_path = None
+        self._nvim_last_mtime = 0.0
+        self._nvim_sync_timer = None
+        self._nvim_write_guard = False
+        self._last_written_hash = None
 
         # Window
         # Use TOPLEVEL so the widget can accept keyboard focus (for SearchEntry)
@@ -391,6 +423,7 @@ class BubblesUI:
         root.set_margin_bottom(10)
         root.set_margin_start(10)
         root.set_margin_end(10)
+        self.root_box = root
 
         # Collapsible header (shows current buffer snippet)
         header = Gtk.EventBox()
@@ -405,19 +438,23 @@ class BubblesUI:
         self.chev_ev = Gtk.EventBox()
         self.chev_ev.add(self.header_icon)
         header_box.pack_start(self.chev_ev, False, False, 0)
-        # scrolling current buffer viewer
+        # scrolling current buffer editor (TextView)
         self.header_scroller = Gtk.ScrolledWindow()
         self.header_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.header_scroller.set_size_request(-1, 84)
         self.header_scroller.set_overlay_scrolling(True)
         self.header_scroller.set_kinetic_scrolling(True)
-        self.header_label = Gtk.Label(label="Transcript")
-        self.header_label.set_xalign(0.0)
-        self.header_label.set_line_wrap(True)
-        if Pango:
-            self.header_label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        self.header_label.set_max_width_chars(46)
-        self.header_scroller.add(self.header_label)
+        self.editor_textview = Gtk.TextView(buffer=self.active_buffer)
+        self.editor_textview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR if Pango else Gtk.WrapMode.WORD)
+        self.editor_textview.set_left_margin(6)
+        self.editor_textview.set_right_margin(6)
+        self.editor_textview.set_pixels_above_lines(2)
+        self.editor_textview.set_pixels_below_lines(2)
+        self.editor_textview.connect("focus-in-event", lambda *a: self._set_editor_focus(True))
+        self.editor_textview.connect("focus-out-event", lambda *a: self._set_editor_focus(False))
+        self.editor_textview.connect("populate-popup", self._populate_editor_menu)
+        self.header_scroller.add(self.editor_textview)
+        self.editor_scroller = self.header_scroller
         header_box.pack_start(self.header_scroller, True, True, 0)
         # small icon copy button
         self.header_copy_btn = Gtk.Button()
@@ -429,6 +466,19 @@ class BubblesUI:
         self.header_copy_btn.set_halign(Gtk.Align.END)
         self.header_copy_btn.connect("clicked", self._on_copy)
         header_box.pack_end(self.header_copy_btn, False, False, 0)
+        # fullscreen toggle
+        self.header_full_btn = Gtk.Button()
+        self.header_full_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.header_full_btn.set_tooltip_text("Toggle fullscreen")
+        self.header_full_btn.get_style_context().add_class("btn")
+        try:
+            self.header_full_btn.set_image(Gtk.Image.new_from_icon_name("view-fullscreen-symbolic", Gtk.IconSize.MENU))
+        except Exception:
+            pass
+        self.header_full_btn.set_valign(Gtk.Align.START)
+        self.header_full_btn.set_halign(Gtk.Align.END)
+        self.header_full_btn.connect("clicked", self._toggle_fullscreen)
+        header_box.pack_end(self.header_full_btn, False, False, 4)
         header.add(header_box)
         root.pack_start(header, False, False, 0)
 
@@ -515,6 +565,7 @@ class BubblesUI:
         self.hist_view.connect("size-allocate", self._on_hist_size_allocate)
 
         hist_scroller.add(self.hist_view)
+        self.hist_scroller = hist_scroller
         hist_frame = Gtk.Frame()
         hist_frame.set_shadow_type(Gtk.ShadowType.NONE)
         hist_frame.get_style_context().add_class("chip")
@@ -525,7 +576,7 @@ class BubblesUI:
         hist_frame.add(hist_scroller)
         content.pack_start(hist_frame, True, True, 0)
 
-        # (Removed bottom current buffer editor; header acts as viewer)
+        # (Editor integrated into header)
 
         self.main_revealer.add(content)
         root.pack_end(self.main_revealer, True, True, 0)
@@ -546,6 +597,9 @@ class BubblesUI:
         self._start_history_load()
         self._ensure_active_session()
         self._update_active_view()
+        # Reflect active buffer changes back to session + header
+        if self.active_buffer is not None:
+            self.active_buffer.connect("changed", self._on_active_buffer_changed)
 
         # header autoscroll logic
         try:
@@ -559,6 +613,17 @@ class BubblesUI:
         except Exception:
             pass
 
+        # history autoscroll logic
+        try:
+            self._hist_autoscroll = True
+            hvadj = self.hist_scroller.get_vadjustment()
+            def on_hist_vadj_changed(adj):
+                at_bottom = (adj.get_upper() - (adj.get_value() + adj.get_page_size())) < 8
+                self._hist_autoscroll = at_bottom
+            hvadj.connect("value-changed", on_hist_vadj_changed)
+        except Exception:
+            self._hist_autoscroll = True
+
         # show
         self._adjust_window_size()
         self.win.show_all()
@@ -570,6 +635,7 @@ class BubblesUI:
         # keep bubble next to blob
         self.anchor_win.connect("configure-event", self._reposition)
         self.win.connect("size-allocate", self._reposition)
+        self.win.connect("window-state-event", self._on_window_state)
         GLib.idle_add(self._place_next_to_anchor)
 
     def _install_css(self):
@@ -617,6 +683,9 @@ class BubblesUI:
             color: rgba(255,255,255,0.98);
             background-color: transparent;
             border: none;
+        }}
+        textview, textview text {{
+            background-color: transparent;
         }}
         frame.bubble > border, frame.chip > border {{
             border-radius: 18px;
@@ -668,16 +737,49 @@ class BubblesUI:
         batch = Cfg.HISTORY_BATCH
         if not hasattr(self, "_initial_loader") or self._initial_loader is None:
             return False
+        # track last timestamp to insert session separators
+        if not hasattr(self, "_last_hist_ts"):
+            self._last_hist_ts = None
         for tstr, txt, ts in self._initial_loader:
+            # Insert session separator if gap exceeded
+            try:
+                if self._last_hist_ts is not None and (ts - self._last_hist_ts) > Cfg.SESSION_GAP_SEC:
+                    self.hist_store.append(["", "— Session —", ""])
+            except Exception:
+                pass
             # column 1 shows the full text (renderer ellipsizes visually)
             self.hist_store.append([tstr, txt, txt])
             self.history.append(TextBufferSession(created_ts=ts, text=txt))
+            self._trim_history()
+            self._last_hist_ts = ts
             count += 1
             if count >= batch:
                 return True  # keep going next idle
         # done
         self._initial_loader = None
+        GLib.idle_add(self._scroll_hist_to_bottom)
         return False
+
+    def _trim_history(self):
+        """Ensure we only keep the most recent MAX_HISTORY_ITEMS in memory and view."""
+        try:
+            max_items = int(getattr(Cfg, "MAX_HISTORY_ITEMS", 0))
+        except Exception:
+            max_items = 0
+        if max_items and len(self.history) > max_items:
+            # Trim backing list
+            excess = len(self.history) - max_items
+            if excess > 0:
+                del self.history[0:excess]
+            # Trim GTK model from the top
+            try:
+                while len(self.hist_store) > max_items:
+                    itr = self.hist_store.get_iter_first()
+                    if itr is None:
+                        break
+                    self.hist_store.remove(itr)
+            except Exception:
+                pass
 
     def _hist_visible_func(self, model, itr, data=None):
         # Filter rows by search query (case-insensitive substring)
@@ -690,13 +792,21 @@ class BubblesUI:
         return q in time_str or q in excerpt or q in full
 
     def _on_search_changed(self, entry):
-        self._search_query = entry.get_text().strip()
+        self._search_query = (entry.get_text() or "").strip()
         try:
             self.hist_filter.refilter()
         except Exception:
             pass
 
     def _poll_tail(self):
+        # Handle file truncation/rotation gracefully
+        try:
+            current_size = os.path.getsize(self.narration_path)
+            if self._file_pos > current_size:
+                # File was truncated; restart from 0
+                self._file_pos = 0
+        except Exception:
+            return True
         try:
             with open(self.narration_path, "r", encoding="utf-8") as f:
                 f.seek(self._file_pos)
@@ -715,16 +825,32 @@ class BubblesUI:
                 txt = ""
             if not txt:
                 continue
-            # Append only when dictation is active
-            if self.dict_control and self.dict_control.is_active():
+            # Insert session separator if gap exceeded
+            try:
+                if hasattr(self, "_last_hist_ts") and self._last_hist_ts is not None and (ts - self._last_hist_ts) > Cfg.SESSION_GAP_SEC:
+                    self.hist_store.append(["", "— Session —", ""])
+            except Exception:
+                pass
+            # Always append to the active buffer as new speech arrives
+            # Start a new session when there is a long inactivity gap
+            try:
+                gap = (ts - getattr(self, "_last_hist_ts", ts)) if getattr(self, "_last_hist_ts", None) is not None else 0
+            except Exception:
+                gap = 0
+            if gap > getattr(Cfg, "SESSION_GAP_SEC", 20.0):
+                self._ensure_active_session(force_new=True)
+            else:
                 self._ensure_active_session()
-                if self.active:
-                    self.active.text = (self.active.text + (" " if self.active.text else "") + txt).strip()
+            # Insert incoming speech at the current caret position
+            self._insert_speech_at_cursor(txt)
             # Also reflect in history model as its own entry (performant append)
             tstr = time.strftime("%H:%M:%S", time.localtime(ts))
             self.hist_store.append([tstr, txt, txt])
             self.history.append(TextBufferSession(created_ts=ts, text=txt))
+            self._trim_history()
+            self._last_hist_ts = ts
         self._update_active_view()
+        GLib.idle_add(self._scroll_hist_to_bottom)
         return True
 
     def _track_active_toggle(self):
@@ -743,19 +869,52 @@ class BubblesUI:
     def _ensure_active_session(self, force_new: bool = False):
         if self.active is None or force_new:
             self.active = TextBufferSession()
+            # reset editor buffer if present
+            if self.active_buffer is not None:
+                try:
+                    self.active_buffer.set_text("")
+                except Exception:
+                    pass
 
     # ---------- UI helpers ----------
 
     def _update_active_view(self):
-        new_text = self.active.text if self.active else ""
-        # Update header viewer text (full), scroller will clip top (show latest)
-        if self.header_label.get_text() != (new_text or ""):
-            self.header_label.set_text(new_text or "Transcript")
+        # Reflect the TextBuffer text into the session model
+        if self.active_buffer is not None:
+            try:
+                start, end = self.active_buffer.get_start_iter(), self.active_buffer.get_end_iter()
+                new_text = self.active_buffer.get_text(start, end, True)
+                if self.active is None:
+                    self._ensure_active_session()
+                if self.active is not None:
+                    self.active.text = new_text
+            except Exception:
+                pass
         # Autoscroll to the end unless user scrolled up
         try:
             vadj = self.header_scroller.get_vadjustment()
             if getattr(self, "_header_autoscroll", True):
                 GLib.idle_add(lambda: vadj.set_value(max(0, vadj.get_upper() - vadj.get_page_size())))
+        except Exception:
+            pass
+        # Also sync to external editor file (nvim) if present
+        try:
+            self._sync_to_nvim_file(new_text or "")
+        except Exception:
+            pass
+        # Update editor buffer if open and not actively edited
+        try:
+            if getattr(self, "editor_textview", None) is not None and not getattr(self, "_editor_has_focus", False):
+                buf = self.editor_textview.get_buffer()
+                cur_text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+                if cur_text != (new_text or ""):
+                    buf.set_text(new_text or "")
+                    GLib.idle_add(self._scroll_editor_to_end_if_needed)
+        except Exception:
+            pass
+        # Update speaking status chip if editor open
+        try:
+            self._update_status_chip()
         except Exception:
             pass
 
@@ -793,8 +952,272 @@ class BubblesUI:
         clipboard.set_text(text, -1)
 
     def _on_copy_history(self, _btn, sess: TextBufferSession):
-        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-        clipboard.set_text(sess.text, -1)
+        try:
+            clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            clipboard.set_text(sess.text, -1)
+        except Exception:
+            pass
+
+    # ---------- Editor actions ----------
+    def _populate_editor_menu(self, widget, menu):
+        try:
+            menu.append(Gtk.SeparatorMenuItem())
+            def add_item(label, cb):
+                mi = Gtk.MenuItem(label=label)
+                mi.connect("activate", lambda *_: cb())
+                menu.append(mi)
+                return mi
+            add_item("Cut", lambda: self._editor_cmd("cut"))
+            add_item("Copy", lambda: self._editor_cmd("copy"))
+            add_item("Paste", lambda: self._editor_cmd("paste"))
+            add_item("Select All", lambda: self._editor_cmd("select_all"))
+            menu.show_all()
+        except Exception:
+            pass
+
+    def _editor_cmd(self, cmd: str):
+        try:
+            tv = getattr(self, 'editor_textview', None)
+            if tv is None:
+                return
+            buf = tv.get_buffer()
+            clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            if cmd == "cut":
+                buf.cut_clipboard(clip, True)
+            elif cmd == "copy":
+                buf.copy_clipboard(clip)
+            elif cmd == "paste":
+                buf.paste_clipboard(clip, None, True)
+            elif cmd == "select_all":
+                start, end = buf.get_bounds()
+                buf.select_range(start, end)
+        except Exception:
+            pass
+
+    # ---------- Active buffer model ----------
+    def _on_active_buffer_changed(self, buf: Gtk.TextBuffer):
+        # Keep session text and header label in sync
+        try:
+            start, end = buf.get_start_iter(), buf.get_end_iter()
+            text = buf.get_text(start, end, True)
+            if self.active is None:
+                self._ensure_active_session()
+            if self.active:
+                self.active.text = text
+            self._update_active_view()
+        except Exception:
+            pass
+
+    def _insert_speech_at_cursor(self, txt: str):
+        if not txt:
+            return
+        buf = self.active_buffer
+        if buf is None:
+            return
+        try:
+            insert_mark = buf.get_insert()
+            it = buf.get_iter_at_mark(insert_mark)
+            need_space = False
+            if it.get_offset() > 0:
+                prev = buf.get_text(buf.get_iter_at_offset(it.get_offset() - 1), it, True)
+                if prev and not prev[-1].isspace() and not txt.startswith((" ", ".", ",", ";", ":", "!", "?")):
+                    need_space = True
+            to_insert = (" " + txt) if need_space else txt
+            buf.insert(it, to_insert)
+            # Ensure caret stays visible
+            GLib.idle_add(self._scroll_editor_caret_visible)
+        except Exception:
+            pass
+
+    def _scroll_editor_caret_visible(self):
+        try:
+            tv = getattr(self, 'editor_textview', None)
+            if tv is None:
+                return False
+            buf = tv.get_buffer()
+            tv.scroll_mark_onscreen(buf.get_insert())
+        except Exception:
+            pass
+        return False
+
+    # ---------- Editor (fullscreen) ----------
+    def _ensure_editor_window(self):
+        if getattr(self, "editor_win", None) is not None:
+            return
+        self.editor_win = Gtk.Window(Gtk.WindowType.TOPLEVEL)
+        self.editor_win.set_decorated(False)
+        self.editor_win.set_app_paintable(True)
+        self.editor_win.set_accept_focus(True)
+        self.editor_win.set_focus_on_map(True)
+        try:
+            scr = Gdk.Screen.get_default()
+            if scr.is_composited() and scr.get_rgba_visual():
+                self.editor_win.set_visual(scr.get_rgba_visual())
+        except Exception:
+            pass
+        self.editor_win.set_keep_above(True)
+        self.editor_win.set_skip_taskbar_hint(True)
+        self.editor_win.set_skip_pager_hint(True)
+        try:
+            self.editor_win.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        except Exception:
+            pass
+        # ESC closes
+        self.editor_win.connect("key-press-event", self._on_editor_key)
+        # layout
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        root.set_margin_top(12)
+        root.set_margin_bottom(12)
+        root.set_margin_start(12)
+        root.set_margin_end(12)
+        frame = Gtk.Frame()
+        frame.get_style_context().add_class("bubble")
+        frame.set_shadow_type(Gtk.ShadowType.NONE)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        vbox.set_margin_top(10)
+        vbox.set_margin_bottom(10)
+        vbox.set_margin_start(10)
+        vbox.set_margin_end(10)
+        # top bar
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        # status chip
+        self.status_chip = Gtk.Label(label="Idle")
+        self.status_chip.get_style_context().add_class("chip")
+        top.pack_start(self.status_chip, False, False, 0)
+        # spacer
+        top.pack_start(Gtk.Box(), True, True, 0)
+        # close button
+        close_btn = Gtk.Button()
+        close_btn.get_style_context().add_class("btn")
+        close_btn.set_relief(Gtk.ReliefStyle.NONE)
+        close_btn.set_tooltip_text("Close editor")
+        try:
+            close_btn.set_image(Gtk.Image.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU))
+        except Exception:
+            pass
+        close_btn.connect("clicked", self._close_editor)
+        top.pack_end(close_btn, False, False, 0)
+        # fullscreen toggle button
+        fs_btn = Gtk.Button()
+        fs_btn.get_style_context().add_class("btn")
+        fs_btn.set_relief(Gtk.ReliefStyle.NONE)
+        fs_btn.set_tooltip_text("Toggle fullscreen")
+        try:
+            fs_btn.set_image(Gtk.Image.new_from_icon_name("view-fullscreen-symbolic", Gtk.IconSize.MENU))
+        except Exception:
+            pass
+        fs_btn.connect("clicked", self._toggle_editor_fullscreen)
+        top.pack_end(fs_btn, False, False, 4)
+        vbox.pack_start(top, False, False, 0)
+        # Prefer Neovim embedded with VTE; fallback to TextView if VTE unavailable
+        if Vte is not None:
+            try:
+                self.terminal = Vte.Terminal()
+                # Make terminal background as transparent as possible
+                try:
+                    rgba = Gdk.RGBA(0, 0, 0, 0)
+                    self.terminal.set_color_background(rgba)
+                except Exception:
+                    pass
+                # spawn nvim with autoread + autocmd to checktime regularly
+                tmppath = self._ensure_nvim_tmpfile()
+                argv = [
+                    "nvim",
+                    "-c",
+                    "set autoread",
+                    "-c",
+                    "set updatetime=500",
+                    "-c",
+                    "autocmd CursorHold,CursorHoldI * checktime",
+                    tmppath,
+                ]
+                self.terminal.spawn_async(
+                    Vte.PtyFlags.DEFAULT,
+                    os.getcwd(),
+                    argv,
+                    [],
+                    GLib.SpawnFlags.SEARCH_PATH,
+                    None,
+                    None,
+                    -1,
+                    None,
+                    None,
+                )
+                vbox.pack_start(self.terminal, True, True, 0)
+                # start sync timer from nvim file
+                self._start_nvim_sync_timer()
+            except Exception:
+                # fallback to TextView
+                self._build_textview_editor(vbox)
+        else:
+            self._build_textview_editor(vbox)
+        frame.add(vbox)
+        root.pack_start(frame, True, True, 0)
+        self.editor_win.add(root)
+        # initial fill/status
+        try:
+            self._update_editor_text()
+        except Exception:
+            pass
+        self._update_status_chip()
+
+    def _build_textview_editor(self, vbox: Gtk.Box):
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_overlay_scrolling(True)
+        scroller.set_kinetic_scrolling(True)
+        self.editor_textview = Gtk.TextView()
+        self.editor_textview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR if Pango else Gtk.WrapMode.WORD)
+        self.editor_textview.set_left_margin(8)
+        self.editor_textview.set_right_margin(8)
+        self.editor_textview.connect("focus-in-event", lambda *a: self._set_editor_focus(True))
+        self.editor_textview.connect("focus-out-event", lambda *a: self._set_editor_focus(False))
+        buf = self.editor_textview.get_buffer()
+        buf.connect("changed", self._on_editor_buffer_changed)
+        scroller.add(self.editor_textview)
+        self.editor_scroller = scroller
+        vbox.pack_start(scroller, True, True, 0)
+
+    # (fullscreen handled by window; no separate editor window)
+
+    # (no external editor text sync; TextView is the source of truth)
+
+    def _on_editor_buffer_changed(self, buf):
+        # Keep header label in sync with editor contents
+        try:
+            self._update_active_view()
+        except Exception:
+            pass
+
+    def _set_editor_focus(self, has_focus: bool):
+        self._editor_has_focus = bool(has_focus)
+
+    def _scroll_hist_to_bottom(self):
+        try:
+            if getattr(self, "_hist_autoscroll", True):
+                adj = self.hist_scroller.get_vadjustment()
+                adj.set_value(max(0, adj.get_upper() - adj.get_page_size()))
+        except Exception:
+            pass
+        return False
+
+    def _scroll_editor_to_end_if_needed(self):
+        try:
+            if getattr(self, "editor_scroller", None) is not None and getattr(self, "editor_textview", None) is not None:
+                adj = self.editor_scroller.get_vadjustment()
+                at_bottom = (adj.get_upper() - (adj.get_value() + adj.get_page_size())) < 8
+                if at_bottom or not getattr(self, "_editor_has_focus", False):
+                    buf = self.editor_textview.get_buffer()
+                    end_iter = buf.get_end_iter()
+                    buf.place_cursor(end_iter)
+                    self.editor_textview.scroll_mark_onscreen(buf.get_insert())
+        except Exception:
+            pass
+        return False
+
+    # (no separate status chip in simplified UI)
+
+    # (no Neovim/VTE file sync in simplified editor)
 
     # removed editing handlers (editor removed)
 
@@ -888,18 +1311,74 @@ class BubblesUI:
             except Exception:
                 pass
 
-    def _toggle_history(self, *_):
-        cur = self.hist_revealer.get_reveal_child()
-        self.hist_revealer.set_reveal_child(not cur)
+    def _toggle_fullscreen(self, *_):
         try:
-            self.hist_icon.set_from_icon_name(
-                "pan-up-symbolic" if not cur else "pan-down-symbolic",
-                Gtk.IconSize.MENU,
+            gdk_win = self.win.get_window()
+            is_full = bool(gdk_win.get_state() & Gdk.WindowState.FULLSCREEN) if gdk_win else False
+        except Exception:
+            is_full = False
+        if is_full:
+            try:
+                self.win.unfullscreen()
+            except Exception:
+                pass
+        else:
+            try:
+                self.win.fullscreen()
+            except Exception:
+                pass
+
+    def _on_window_state(self, _w, event):
+        try:
+            is_full = bool(event.new_window_state & Gdk.WindowState.FULLSCREEN)
+        except Exception:
+            is_full = False
+        # Update icon and layout
+        try:
+            self.header_full_btn.set_image(
+                Gtk.Image.new_from_icon_name(
+                    "view-restore-symbolic" if is_full else "view-fullscreen-symbolic",
+                    Gtk.IconSize.MENU,
+                )
             )
         except Exception:
             pass
-        GLib.idle_add(self._adjust_window_size)
+        self._apply_fullscreen_layout(is_full)
+        return False
 
+    def _apply_fullscreen_layout(self, is_full: bool):
+        try:
+            # Expand header to fill when fullscreen; hide history pane
+            self.root_box.set_child_packing(self.root_box.get_children()[0], is_full, is_full, 0, Gtk.PackType.START)
+        except Exception:
+            pass
+        try:
+            if is_full:
+                self.main_revealer.hide()
+                self.header_scroller.set_size_request(-1, -1)
+                self.editor_textview.grab_focus()
+            else:
+                self.main_revealer.show_all()
+                self.header_scroller.set_size_request(-1, 84)
+        except Exception:
+            pass
+
+    def _toggle_history(self, *_):
+        # No-op if the history revealer has been removed
+        if not hasattr(self, "hist_revealer") or self.hist_revealer is None:
+            return False
+        cur = self.hist_revealer.get_reveal_child()
+        self.hist_revealer.set_reveal_child(not cur)
+        try:
+            if hasattr(self, "hist_icon") and self.hist_icon is not None:
+                self.hist_icon.set_from_icon_name(
+                    "pan-up-symbolic" if not cur else "pan-down-symbolic",
+                    Gtk.IconSize.MENU,
+                )
+        except Exception:
+            pass
+        GLib.idle_add(self._adjust_window_size)
+        
     def _adjust_window_size(self):
         # When collapsed, shrink to header; when expanded, use target size.
         self._suppress_reposition = True
