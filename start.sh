@@ -12,4 +12,4 @@ cd "$SCRIPT_DIR" || exit 1
 source "${SCRIPT_DIR}/.venv/bin/activate"
 
 # 4) Delegate to your CLI, forwarding all args
-exec python -m main "$@"
+exec python3 src/main.py "$@"
